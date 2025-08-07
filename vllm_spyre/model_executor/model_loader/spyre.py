@@ -149,12 +149,12 @@ class FmsModelBase(nn.Module):
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         max_prompt_length: int,
         max_decode_length: int,
         sendnn_dynamic: bool,
+        vllm_config: VllmConfig=None,
     ) -> None:
         super().__init__()
 
@@ -464,12 +464,12 @@ class StaticBatchingVllmModel(FmsModelBase):
         max_prompt_length: int,
         max_decode_length: int,
     ) -> None:
-        super().__init__(vllm_config,
-                    vllm_config.model_config,
+        super().__init__(vllm_config.model_config,
                     vllm_config.parallel_config,
                     max_prompt_length,
                     max_decode_length,
-                    sendnn_dynamic=False)
+                    sendnn_dynamic=False,
+                    vllm_config=vllm_config)
 
     def forward(
         self,

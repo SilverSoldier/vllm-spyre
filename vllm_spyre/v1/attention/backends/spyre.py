@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Type
 
 import torch
-from torch.nn.functional import scaled_dot_product_attention
+import torch.nn.functional as F
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer,
@@ -142,6 +142,9 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
                                       "are not implemented for "
                                       "SpyreSDPABackendImpl")
 
+        self.sdpa_compute_prefill = self._sdpa_compute_op
+        self.sdpa_compute_decode = self._sdpa_compute_op
+
     def _add_kv_cache(
             self,
             key: torch.Tensor,
@@ -175,6 +178,83 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
 
         return key_result, value_result, kv_cache
 
+    def _sdpa_store_op(
+            self,
+            keys: torch.Tensor,
+            values: torch.Tensor,
+            key_cache: Optional[torch.Tensor],
+            value_cache: Optional[torch.Tensor],
+            attn_metadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        keys = keys.transpose(2, 1)
+        values = values.transpose(2, 1)
+
+        if key_cache is not None and value_cache is not None and value_cache.numel() > 0:
+            key_cache_result = torch.cat((key_cache, keys), dim=2)
+            value_cache_result = torch.cat((value_cache, values), dim=2)
+            return (
+                key_cache_result,
+                value_cache_result,
+                key_cache_result,
+                value_cache_result,
+            )
+        else:
+            return (keys, values, keys, values)
+
+    def _sdpa_compute_op(
+            self,
+            query: torch.Tensor,
+            key_cache: torch.Tensor,
+            value_cache: torch.Tensor,
+            nheads: int,
+            kvheads: int,
+            p_dropout: float,
+            scale_factor: Optional[float],
+            attn_metadata: SpyreSDPAMetadata,
+            ) -> torch.Tensor:
+        queries = query.transpose(2, 1)
+
+        if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
+            key_cache = key_cache.transpose(2, 1)
+            value_cache = value_cache.transpose(2, 1)
+
+        mask = attn_metadata.masks
+        if mask is not None and len(mask.size()) != 4:
+            mask = mask.unsqueeze(1)
+
+        # Expand kv so black-box attn will work
+        expansion = nheads // kvheads
+        # k/v: b h l d
+        if expansion != 1:
+            keys_e = key_cache.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            values_e = value_cache.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        else:
+            keys_e = key_cache
+            values_e = value_cache
+
+        attn_mask = mask
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(dtype=queries.dtype)
+
+        is_causal = attn_metadata.is_prefill and (mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1))
+
+        attn = F.scaled_dot_product_attention(
+            queries,
+            keys_e,
+            values_e,
+            attn_mask=attn_mask,
+            dropout_p=p_dropout,
+            is_causal=is_causal,
+            scale=scale_factor,
+        )
+
+        # attn: bs x seq_len x nheads*emb_v_per_head
+        # attn: b x h x qlen x ds
+        # attn after permute: b x qlen x h x ds
+        # b x qlen x (d)
+        attn = attn.transpose(2, 1).contiguous()
+        return attn
+
     def forward(
             self,
             layer: AttentionLayer,
@@ -198,26 +278,59 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         """
         bsize = attn_metadata.bsize
         # Reshape the query, key, and value tensors.
-        query = query.view(bsize, -1, self.num_heads, self.head_size)
-        if key is not None:
-            assert value is not None
-            key = key.view(bsize, -1, self.num_kv_heads, self.head_size)
-            value = value.view(bsize, -1, self.num_kv_heads, self.head_size)
+        queries = query.view(bsize, -1, self.num_heads, self.head_size)
+        q_len = query.shape[1]
+
+        keys = key.view(bsize, q_len, self.num_kv_heads, self.head_size).to(dtype=queries.dtype)
+        values = value.view(bsize, q_len, self.num_kv_heads, self.head_size).to(dtype=queries.dtype)
+
+        past_token = attn_metadata.past_token
+        if attn_metadata.is_prefill:
+            past_key_value_state = (None, None)
         else:
-            assert value is None
+            past_key_value_state = kv_cache[:,:,:,:past_token,:]
 
-        # For fms
-        query = query.transpose(2, 1) # bsize x n_heads x qlen x kv_len
-        key = key.transpose(2, 1) # bsize x num_kv_heads x qlen x kv_len
-        value = value.transpose(2, 1) # bsize x num_kv_heads x qlen x kv_len
+        keys_compute, values_compute, keys_return, values_return = (
+            self._sdpa_store_op(
+                keys,
+                values,
+                past_key_value_state[0],
+                past_key_value_state[1],
+                attn_metadata,
+            )
+        )
 
-        keys, values, new_kv_cache = self._add_kv_cache(key, value, kv_cache, attn_metadata)
-        kv_cache.copy_(new_kv_cache)
-        attn_output = self._sdpa_forward(query, keys, values, attn_metadata)
+        if attn_metadata.is_prefill:
+            attn = self.sdpa_compute_prefill(
+                queries,
+                keys_compute,
+                values_compute,
+                self.num_heads,
+                self.num_kv_heads,
+                0.0, # dropout
+                self.scale,
+                attn_metadata,
+            )
+        else:
+            attn = self.sdpa_compute_decode(
+                queries,
+                keys_compute,
+                values_compute,
+                self.num_heads,
+                self.num_kv_heads,
+                0.0,
+                self.scale,
+                attn_metadata,
+            )
 
-        # Reshape the output tensor.
-        attn_output = attn_output.view(-1, self.num_heads * self.head_size)
-        return attn_output
+        attn = attn.view(-1, self.num_heads * self.head_size)
+
+        # Store back KV cache
+        # kv_len = keys_return.shape[2]
+        # kv_cache[0,:,:,:kv_len,:] = keys_return
+        # kv_cache[1,:,:,:kv_len,:] = values_return
+
+        return attn
 
     def _sdpa_forward(
             self,

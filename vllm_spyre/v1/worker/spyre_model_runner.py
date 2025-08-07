@@ -1244,7 +1244,7 @@ class VllmModelStaticSpyreModelRunner(StaticBatchingSpyreModelRunner):
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size)
-                spyre_kv_cache = torch.zeros(kv_cache_shape, dtype=torch.float16)
+                spyre_kv_cache = torch.zeros(kv_cache_shape, dtype=torch.bfloat16)
                 #spyre_kv_cache = None
                 kv_caches[layer_name] = spyre_kv_cache
 
