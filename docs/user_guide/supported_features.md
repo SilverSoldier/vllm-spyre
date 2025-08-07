@@ -10,7 +10,6 @@ This table summarize the status of features on Spyre. By default, those features
 | Prompt Adapter                |   ⛔   | Being deprecated in vLLM [vllm#13981](https://github.com/vllm-project/vllm/issues/13981) |
 | Speculative Decoding          |   🗓️   |      |
 | Guided Decoding               |   🗓️   |      |
-| Pooling                       |   ⚠️   | Works with V0. V1 still being developed in vLLM [vllm#18052](https://github.com/vllm-project/vllm/issues/18052) |
 | Enc-dec                       |   ⛔   | No plans for now |
 | Multi Modality                |   🗓️   |      |
 | LogProbs                      |   ✅   |      |
@@ -24,6 +23,7 @@ This table summarize the status of features on Spyre. By default, those features
 | Prefill Decode Disaggregation |   🗓️   |      |
 | Quantization                  |   ⚠️   |      |
 | Sleep Mode                    |   🗓️   |      |
+| Embedding models              |   ✅   |      |
 
 - ✅ Fully operational.
 - ⚠️ Experimental support.

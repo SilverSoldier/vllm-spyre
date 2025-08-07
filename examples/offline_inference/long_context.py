@@ -47,10 +47,16 @@ parser.add_argument("--tp", type=int, default=1)
 parser.add_argument("--num-prompts", "-n", type=int, default=8)
 parser.add_argument("--compare-with-cpu",
                     action=argparse.BooleanOptionalAction)
+parser.add_argument("--trunc_print_len",
+                    "--trunc-print-len",
+                    type=int,
+                    required=False)
 args = parser.parse_args()
 
+trunc = args.trunc_print_len
+
 max_num_seqs = args.max_num_seqs  # defines the max batch size
-assert args.max_prompt_len < args.max_model_len
+assert args.max_prompt_len <= args.max_model_len
 
 if platform.machine() == "arm64":
     print("Detected arm64 running environment. "
@@ -62,7 +68,6 @@ if platform.machine() == "arm64":
 if "VLLM_SPYRE_DYNAMO_BACKEND" not in os.environ:
     os.environ['VLLM_SPYRE_DYNAMO_BACKEND'] = 'eager'
 os.environ['VLLM_SPYRE_USE_CB'] = '1'
-os.environ['VLLM_USE_V1'] = '1'
 
 template = ("Summarize the following code: \n\n{}")
 
@@ -116,7 +121,7 @@ def round_up(t):
 
 
 tokens_to_generate = [
-    args.max_model_len - round_up(plen) for plen in prompt_lens
+    args.max_model_len + 1 - round_up(prompt_len) for prompt_len in prompt_lens
 ]
 
 sampling_params = [
@@ -144,8 +149,8 @@ outputs = llm.generate(vllm_token_prompts, sampling_params)
 print("Time elapsed for all prompts is %.2f sec" % (time.time() - t0))
 print("===============")
 for output, prompt in zip(outputs, prompts):
-    generated_text = output.outputs[0].text[:100]
-    prompt = prompt[:100]
+    generated_text = output.outputs[0].text[:trunc]
+    prompt = prompt[:trunc]
     print(f"\nPrompt:\n {prompt!r}")
     print(f"\nGenerated text (truncated):\n {generated_text!r}\n")
     print("-----------------------------------")
@@ -177,9 +182,9 @@ if args.compare_with_cpu:
             any_differ = True
             spyre_output = outputs[i].outputs[0].text
             print(f"Results for prompt {i} differ on cpu")
-            print(f"\nPrompt:\n {prompt[:100]!r}")
-            print(f"\nSpyre generated text:\n {spyre_output[:100]!r}\n")
-            print(f"\nCPU generated text:\n {hf_generated_text[:100]!r}\n")
+            print(f"\nPrompt:\n {prompt[:trunc]!r}")
+            print(f"\nSpyre generated text:\n {spyre_output[:trunc]!r}\n")
+            print(f"\nCPU generated text:\n {hf_generated_text[:trunc]!r}\n")
             print("-----------------------------------")
 
     if not any_differ:
