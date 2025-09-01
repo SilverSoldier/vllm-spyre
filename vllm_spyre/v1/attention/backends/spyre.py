@@ -85,7 +85,7 @@ class SpyreSDPAMetadataBuilder(AttentionMetadataBuilder[SpyreSDPAMetadata]):
         num_tokens = len(data.input_tokens)
         is_prefill = data.is_prompt
         bsize = len(data.input_positions)
-        past_token = 0
+        past_token = [0 for _ in bsize]
         # TODO: Handle batch sizes later
         if not is_prefill:
             past_token = data.input_masks.shape[2] - 1 # bsize x qsize x kvsize
@@ -145,46 +145,12 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         self.sdpa_compute_prefill = self._sdpa_compute_op
         self.sdpa_compute_decode = self._sdpa_compute_op
 
-    def _add_kv_cache(
-            self,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            kv_cache: torch.Tensor,
-            attn_metadata: SpyreSDPAMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            keys: shape = [bsize, num_tokens, num_kv_heads, head_size]
-            values: shape = [bsize, num_tokens, num_kv_heads, head_size]
-            kv_cache = [2, bsize, num_tokens, num_kv_heads, head_size]
-        Returns:
-            shape = [bsize, num_tokens, num_kv_heads, head_size] * 2
-        """
-        if kv_cache.dtype != key.dtype:
-            kv_cache = kv_cache.to(dtype=key.dtype)
-
-        past_token = attn_metadata.past_token
-        if attn_metadata.is_prefill:
-            key_result, value_result = key, value
-        else:
-            keys = kv_cache[0,:,:,:past_token,:] # bsize x kv_heads x qlen x head_dim for fms
-            values = kv_cache[1,:,:,:past_token,:]
-            key_result = torch.cat((keys, key), dim=2) 
-            value_result = torch.cat((values, value), dim=2)
-
-        kv_len = key.shape[2] 
-        kv_cache[0,:,:,past_token:past_token + kv_len,:] = key
-        kv_cache[1,:,:,past_token:past_token + kv_len,:] = value
-
-        return key_result, value_result, kv_cache
-
     def _sdpa_store_op(
             self,
             keys: torch.Tensor,
             values: torch.Tensor,
             key_cache: Optional[torch.Tensor],
             value_cache: Optional[torch.Tensor],
-            attn_metadata,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         keys = keys.transpose(2, 1)
         values = values.transpose(2, 1)
@@ -217,10 +183,11 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
             key_cache = key_cache.transpose(2, 1)
             value_cache = value_cache.transpose(2, 1)
-
         mask = attn_metadata.masks
-        if mask is not None and len(mask.size()) != 4:
-            mask = mask.unsqueeze(1)
+
+        if mask is not None:
+            while len(mask.size()) != 4:
+                mask = mask.unsqueeze(1)
 
         # Expand kv so black-box attn will work
         expansion = nheads // kvheads
@@ -296,7 +263,6 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
                 values,
                 past_key_value_state[0],
                 past_key_value_state[1],
-                attn_metadata,
             )
         )
 
@@ -331,41 +297,3 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         # kv_cache[1,:,:,:kv_len,:] = values_return
 
         return attn
-
-    def _sdpa_forward(
-            self,
-            query: torch.Tensor, # bsize x nheads x qlen x head_dim
-            key: torch.Tensor, # bsize x num_kv_heads x qlen x kv_len
-            value: torch.Tensor, # bsize x num_kv_heads x qlen x kv_len
-            attn_metadata
-    ) -> torch.Tensor: # (bsize x qlen) x nheads x kv_len
-
-        bsize, nheads, qlen, _ = query.shape
-        assert self.num_kv_heads == key.shape[1]
-
-        if self.num_kv_heads != self.num_heads:
-            key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
-            value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
-
-        # Handle batchsize here
-        query = query.squeeze(0)
-        key = key.squeeze(0)
-        value = value.squeeze(0)
-
-        masks = attn_metadata.masks
-        if masks.dtype != query.dtype:
-            masks = masks.to(dtype=query.dtype)
-        out = scaled_dot_product_attention(
-            query[None,:,:,:],
-            key[None,:,:,:],
-            value[None,:,:,:],
-            is_causal=False,
-            scale=self.scale,
-            dropout_p=0.0,
-            attn_mask=masks[None,:,:,:],
-        ) # bsize x nheads x qlen x kv_len
-
-        # Need to return qlen x (nheads x kv_len)
-        # TODO: change for bsize > 1
-        out = out.transpose(2, 1).squeeze(0).contiguous()
-        return out

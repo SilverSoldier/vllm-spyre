@@ -479,12 +479,10 @@ class StaticBatchingVllmModel(FmsModelBase):
         **extra_kwargs,
     ) -> torch.Tensor:
 
-        output = self.model(
-            input_ids,
-            positions=position_ids,
-        )
 
-        return output
+        #output = self.model(input_ids, positions=position_ids,)
+
+        return input_ids
 
     def compute_logits(self,
             hidden_states: torch.Tensor,

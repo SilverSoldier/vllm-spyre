@@ -255,7 +255,11 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT,
             torch._dynamo.mark_static(model_input.input_positions, 1)
         else:
             # we always want the decode to be dynamic on sequence
-            torch._dynamo.mark_dynamic(model_input.input_masks, 2)
+            if envs_spyre.VLLM_SPYRE_VLLM_MODEL:
+                torch._dynamo.mark_static(model_input.input_masks, 2)
+            else:
+                torch._dynamo.mark_dynamic(model_input.input_masks, 2)
+            pass
 
     @SpyrePlatform.inference_mode()
     @abstractmethod
@@ -284,6 +288,7 @@ class SpyreModelRunner(BaseSpyreModelRunner[SamplingInputBatch,
         max_pad_length = max(prompt_lens)
         max_decode_length = max(num_decode_tokens)
         self.model = SpyreCausalLM(
+            self.vllm_config,
             self.model_config,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
@@ -1346,7 +1351,7 @@ class VllmModelStaticSpyreModelRunner(StaticBatchingSpyreModelRunner):
 
         for i , kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-            print(f"Block size: {kv_cache_spec.block_size}")
+            #print(f"Block size: {kv_cache_spec.block_size}")
             for layer_name in kv_cache_group_spec.layer_names:
                 kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks,
