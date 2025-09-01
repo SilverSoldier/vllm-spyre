@@ -119,7 +119,7 @@ class SpyrePlatform(Platform):
         compilation_config.pass_config.enable_attn_fusion = False
         compilation_config.level = CompilationLevel.NO_COMPILATION
 
-        if scheduler_config.is_multi_step:
+        if getattr(scheduler_config, "is_multi_step", False):
             raise NotImplementedError
 
         # Can be simplified after the deprecation of `model_config.task` in
@@ -144,6 +144,14 @@ class SpyrePlatform(Platform):
                 "spyre_worker.SpyreWorker"
 
         cls._check_threading_config(parallel_config.world_size)
+
+        # set env vars based on the model
+        if is_decoder:
+            os.environ["FLEX_OVERWRITE_NMB_FRAME"] = "true"
+            os.environ["COMPILATION_MODE"] = "offline_decoder"
+        if is_pooling:
+            os.environ["FLEX_OVERWRITE_NMB_FRAME"] = "false"
+            os.environ["COMPILATION_MODE"] = "offline"
 
         if envs_spyre.VLLM_SPYRE_USE_CB and is_decoder:
             scheduler_config.scheduler_cls = "vllm_spyre.v1.core."\
@@ -211,9 +219,38 @@ class SpyrePlatform(Platform):
         # set env vars for torch_sendnn to consume
         os.environ["VLLM_DT_MAX_CONTEXT_LEN"] = str(
             vllm_config.model_config.max_model_len)
-        # min decode batch size is 2 due to symbolic shape constraint in torch
+        if (envs_spyre.VLLM_SPYRE_USE_CB
+                and vllm_config.model_config.max_model_len > 32 * 1024):
+            logger.warning(
+                'Max context length is too big. Currently only 32K (32768) ' \
+                'context length is supported on Spyre for continuous ' \
+                'batching. Results might be off!'
+            )
+        # min value 2 needed for VLLM_DT_MAX_BATCH_SIZE (compiler constraint)
+        # Note that we can still have decodes of batch size 1 as the env var
+        # only concerns the max batch size.
         os.environ["VLLM_DT_MAX_BATCH_SIZE"] = str(
             max(vllm_config.scheduler_config.max_num_seqs, 2))
+
+        # max product of batch size x tkv supported by the Spyre compiler
+        if ('granite-3.3-8b-instruct' in model_config.model
+                and parallel_config.world_size == 4):
+            # hard coded value for tensor parallel size 4 with the below model
+            # https://huggingface.co/ibm-granite/granite-3.3-8b-instruct
+            os.environ["VLLM_DT_MAX_BATCH_TKV_LIMIT"] = str(128 * 1024)
+            logger.info("Model granite-3.3-8b-instruct and tensor parallel " \
+            "size 4 detected. Using VLLM_DT_MAX_BATCH_TKV_LIMIT = %d",
+            128 * 1024)
+        else:
+            # default value for any other model/ tensor parallel size
+            default_max_batch_tkv_limit = \
+                vllm_config.model_config.max_model_len * \
+                vllm_config.scheduler_config.max_num_seqs
+            os.environ["VLLM_DT_MAX_BATCH_TKV_LIMIT"] = str(
+                default_max_batch_tkv_limit)
+            logger.info("No model / tensor parallel size specific value for " \
+            "VLLM_DT_MAX_BATCH_TKV_LIMIT found. Using the default value " \
+            "(max_model_len * max_batch_size): %d", default_max_batch_tkv_limit)
 
     @classmethod
     def use_all_gather(cls) -> bool:

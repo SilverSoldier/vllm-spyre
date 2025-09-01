@@ -2,7 +2,8 @@ import inspect
 import os
 
 import pytest
-from spyre_util import get_spyre_model_list
+
+from vllm_spyre.compat_utils import dataclass_fields
 
 pytestmark = pytest.mark.compat
 
@@ -31,7 +32,6 @@ def test_vllm_bert_support():
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("model", get_spyre_model_list())
 def test_model_config_task(model: str):
 
     from vllm.engine.arg_utils import EngineArgs
@@ -88,6 +88,55 @@ def test_pooler_from_config():
 
 
 @pytest.mark.cpu
+def test_pooler_default_args():
+
+    from vllm.model_executor.layers.pooler import Pooler
+    has_from_config = hasattr(Pooler, "from_config_with_defaults")
+
+    if not has_from_config:
+        annotations = inspect.getfullargspec(Pooler.for_embed).annotations
+        if VLLM_VERSION == "vLLM:main":
+            assert 'default_normalize' not in annotations
+            assert 'default_softmax' not in annotations
+        elif VLLM_VERSION == "vLLM:lowest":
+            assert 'default_normalize' in annotations
+            assert 'default_softmax' in annotations
+            # The compat code introduced in the PR below can now be removed:
+            # https://github.com/vllm-project/vllm-spyre/pull/361
+
+
+@pytest.mark.cpu
+def test_pooler_default_pooling_type():
+
+    from vllm.model_executor.layers.pooler import Pooler
+    has_from_config = hasattr(Pooler, "from_config_with_defaults")
+
+    if not has_from_config:
+        annotations = inspect.getfullargspec(Pooler.for_embed).annotations
+        if VLLM_VERSION == "vLLM:main":
+            assert 'default_pooling_type' not in annotations
+        elif VLLM_VERSION == "vLLM:lowest":
+            assert 'default_pooling_type' in annotations
+            # The compat code introduced in the PR below can now be removed:
+            # https://github.com/vllm-project/vllm-spyre/pull/374
+
+
+@pytest.mark.cpu
+def test_multi_step_scheduling():
+
+    from vllm.config import SchedulerConfig
+    has_multi_step = hasattr(SchedulerConfig, "is_multi_step")
+
+    if VLLM_VERSION == "vLLM:main":
+        assert not has_multi_step
+    elif VLLM_VERSION == "vLLM:lowest":
+        assert has_multi_step, ("The lowest supported vLLM version already"
+                                "removed multi-step scheduling.")
+        # The compat code introduced in the PR below can now be removed:
+        # https://github.com/vllm-project/vllm-spyre/pull/374
+
+
+@pytest.mark.cpu
 def test_engine_core_add_request():
 
     from vllm.v1.engine import EngineCoreRequest
@@ -104,3 +153,18 @@ def test_engine_core_add_request():
             "switched to the new definition of EngineCore.add_request()")
         # The compat code introduced in the PR below can now be removed:
         # https://github.com/vllm-project/vllm-spyre/pull/354
+
+
+@pytest.mark.cpu
+def test_mm_inputs():
+
+    from vllm.v1.core.sched.output import NewRequestData
+    has_mm_inputs = 'mm_inputs' in dataclass_fields(NewRequestData)
+
+    if VLLM_VERSION == "vLLM:main":
+        assert not has_mm_inputs
+    elif VLLM_VERSION == "vLLM:lowest":
+        assert has_mm_inputs, ("The lowest supported vLLM version already"
+                               "renamed mm_inputs to mm_kwargs.")
+        # The compat code introduced in the PR below can now be removed:
+        # https://github.com/vllm-project/vllm-spyre/pull/380

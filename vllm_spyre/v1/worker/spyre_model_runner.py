@@ -1,3 +1,4 @@
+import inspect
 import math
 import time
 from abc import ABC, abstractmethod
@@ -21,6 +22,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, KVCacheCo
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
 import vllm_spyre.envs as envs_spyre
+import vllm_spyre.utils as utils_spyre
 from vllm_spyre.model_executor.model_loader.spyre import (
     BACKEND_LIST, SpyreAttentionMetadata, SpyreCausalLM)
 from vllm_spyre.platform import SpyrePlatform
@@ -102,8 +104,10 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT,
         self,
         vllm_config: VllmConfig,
         is_driver_worker: bool,
+        rank: int,
     ):
         self.is_driver_worker = is_driver_worker
+        self.rank = rank
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -124,6 +128,11 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT,
             if self.model_config.get_sliding_window():
                 logger.warning("Sliding window is not supported on Spyre. "
                                "The model will run without sliding window.")
+            assert (
+                self.cache_config.block_size == self.model_config.max_model_len
+            ), ("cache_config.block_size must be set to model_config."
+                "max_model_len to disable any paged attention ops in the base "
+                "scheduler.")
         if vllm_config.device_config is None:
             self.device_config = DeviceConfig()
         self.device = self.device_config.device
@@ -275,13 +284,11 @@ class SpyreModelRunner(BaseSpyreModelRunner[SamplingInputBatch,
                                             SamplingRequestState,
                                             SamplingForwardInputs]):
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        is_driver_worker: bool,
-    ):
+    def __init__(self, vllm_config: VllmConfig, is_driver_worker: bool,
+                 rank: int):
         super().__init__(vllm_config=vllm_config,
-                         is_driver_worker=is_driver_worker)
+                         is_driver_worker=is_driver_worker,
+                         rank=rank)
 
     def load_model(self, prompt_lens: Iterable[int],
                    num_decode_tokens: Iterable[int]) -> None:
@@ -294,16 +301,12 @@ class SpyreModelRunner(BaseSpyreModelRunner[SamplingInputBatch,
             scheduler_config=self.scheduler_config,
             max_prompt_length=max_pad_length,
             max_decode_length=max_decode_length,
+            rank=self.rank,
         )
 
     def build_input_batch(self) -> SamplingInputBatch:
-        # Fix for batch size 1: set input batch to fit 2 requests for warmup,
-        # and reset input batch to fit max_num_seqs requests after warmup
-        min_seqs_required = 2 if self.warmup_mode else 1
-
         return SamplingInputBatch(
-            max_num_reqs=max(min_seqs_required,
-                             self.scheduler_config.max_num_seqs),
+            max_num_reqs=self.scheduler_config.max_num_seqs,
             max_model_len=self.model_config.max_model_len,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -608,9 +611,11 @@ class StaticBatchingSpyreModelRunner(WarmupShapesMixin, SpyreModelRunner):
         self,
         vllm_config: VllmConfig,
         is_driver_worker: bool,
+        rank: int,
     ):
         super().__init__(vllm_config=vllm_config,
-                         is_driver_worker=is_driver_worker)
+                         is_driver_worker=is_driver_worker,
+                         rank=rank)
 
         # position_ids of all the sequences in current batch
         self._position_ids: torch.Tensor = None
@@ -793,9 +798,11 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         self,
         vllm_config: VllmConfig,
         is_driver_worker: bool,
+        rank: int,
     ):
         super().__init__(vllm_config=vllm_config,
-                         is_driver_worker=is_driver_worker)
+                         is_driver_worker=is_driver_worker,
+                         rank=rank)
 
         self.block_size = SpyrePlatform.get_block_size()
 
@@ -805,15 +812,6 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         self.req_ids2reserved_blocks: dict[str, int] = {}
 
         self.tkv: int = 0
-        # set self.block_pool to the minimal value of 4 required for warmup
-        # is reset to the value returned by the Spyre compiler after warmup
-        # self._set_blocks(num_blocks=4)
-        # for the time being we set this to num_blocks consistent with the
-        # cache dimension of ContinuousBatchingFmsModel.past_key_value_states
-        num_blocks = (vllm_config.scheduler_config.max_num_seqs *
-                      vllm_config.model_config.max_model_len //
-                      self.block_size)
-        self._set_blocks(num_blocks=num_blocks)
 
         # TODO: Remove this once we can prefill and decode in the same step
         self.prefill_batch = SamplingInputBatch(
@@ -826,13 +824,34 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
             vocab_size=vllm_config.model_config.get_vocab_size(),
         )
 
+    def pre_warmup(self) -> None:
+        # Set the number of kv cache blocks to the minimal value of 2 which is
+        # required for warmup. After the warmup, the number of blocks will be
+        # set to the value returned by the Spyre compiler (see complete_warmup)
+        # Note: Until this feature is supported by the compiler we have to set:
+        # n_blocks_warmup = n_blocks_avail
+
+        n_blocks_warmup = self.model.model.get_num_blocks_available()
+        self._set_blocks(num_blocks=n_blocks_warmup)
+        self.model.model._set_past_key_value_states(num_blocks=n_blocks_warmup)
+
+        # Future code:
+
+        # self._set_blocks(num_blocks=2)
+        # self.model.model._set_past_key_value_states(num_blocks=2)
+
+        # mark the num_blocks dimension dynamic for Spyre compiler for warmup
+        # only, compiler will return the number of blocks it can accommodate.
+        # (This is not yet supported by the compiler)
+        # for layer in self.model.model.past_key_value_states:
+        #     for tensor in layer:
+        #         torch._dynamo.mark_dynamic(tensor, 0)
+
     def complete_warmup(self) -> None:
         super().complete_warmup()
-        # Fix for batch size 1: need to update the input_batch after the warmup
-        self.input_batch = self.build_input_batch()
         # get the number or pages from the actual Spyre card after the warmup
-        # and set it accordingly in the model runner and the kv cache size
-        n_blocks_avail = self._get_num_blocks_available()
+        # and set it accordingly in the model runner and for the kv cache size
+        n_blocks_avail = self.model.model.get_num_blocks_available()
         self._set_blocks(num_blocks=n_blocks_avail)
         self.model.model._set_past_key_value_states(num_blocks=n_blocks_avail)
 
@@ -848,49 +867,6 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         # set number of available blocks and populate block_pool
         self.n_blocks = num_blocks
         self.block_pool = deque([i for i in range(self.n_blocks)])
-
-    def _get_num_blocks_available(self) -> int:
-        """Function returns the number of available blocks/pages.
-        Will eventually contain a function in torch_sendnn which reads 
-        the actual value provided by the compiler for backend sendnn"""
-
-        max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
-        max_model_len = self.vllm_config.scheduler_config.max_model_len
-
-        min_req_num_blocks = max_model_len // self.block_size
-        # min_req_num_blocks is not enough blocks for the following test:
-        # tests/e2e/test_spyre_cb.py::test_scheduler_cb_steps_tkv
-        # [seqs_max_tokens4-prompts_lengths4-steps_add_reqs4-
-        # checked_steps4-256-False-2-eager-llama-194m]
-
-        if envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND == 'sendnn':
-            # TODO: replace num_blocks_spyre by calling a function in
-            # torch_sendnn which returns the value set by the Spyre compiler
-            num_blocks_spyre = max_batch_size * min_req_num_blocks
-            assert num_blocks_spyre >= min_req_num_blocks, (
-                "Number of pages available on Spyre (%d) is not enough to "
-                "serve the current model (need at least %d pages)." %
-                (num_blocks_spyre, min_req_num_blocks))
-            max_concurrency_spyre = num_blocks_spyre * self.block_size \
-                / max_model_len
-            logger.info("Spyre KV cache size: %s tokens",
-                        num_blocks_spyre * self.block_size)
-            logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                        str(max_model_len), max_concurrency_spyre)
-            return num_blocks_spyre
-        else:  # dynamo backend 'eager'
-            num_blocks_cpu = max_batch_size * min_req_num_blocks
-            assert num_blocks_cpu >= min_req_num_blocks, (
-                "Number of pages available on CPU (%d) is not enough to "
-                "serve the current model (need at least %d pages)." %
-                (num_blocks_cpu, min_req_num_blocks))
-            max_concurrency_cpu = num_blocks_cpu * self.block_size \
-                / max_model_len
-            logger.info("CPU KV cache size: %s tokens",
-                        num_blocks_cpu * self.block_size)
-            logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                        str(max_model_len), max_concurrency_cpu)
-            return num_blocks_cpu
 
     def update_states(self, scheduler_output):
 
@@ -920,10 +896,23 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
         is_new_batch = len(self.req_ids2blocks) == 0
         prompt_len = len(prompt_token_ids)
 
-        # make sure that the prompt length is at most the current tkv
-        # if it joins an existing decode batch
-        if not is_new_batch:
-            assert prompt_len <= self.tkv
+        # make sure that the current tkv of the decode batch is greater or
+        # equal to the prompt length of the new joining sequence
+        if not is_new_batch and prompt_len > self.tkv:
+            # increasing the current tkv by a multiple of the block size
+            tkv_offset = math.ceil(
+                (prompt_len - self.tkv) / self.block_size) * self.block_size
+            if tkv_offset > 0:
+                logger.debug("Prefill optimization: Adding %d blocks per " \
+                "sequence in the decode batch to prefill the current " \
+                "sequence.", tkv_offset // self.block_size)
+                self.tkv += tkv_offset
+
+                # adding left pads to the requests in the current decode batch
+                requests = self.requests.values()
+                for req in requests:
+                    if req.req_id != req_id:
+                        req.left_padding += tkv_offset
 
         self.prefill_batch.clear_requests()
 
@@ -1116,23 +1105,6 @@ class ContinuousBatchingSpyreModelRunner(SpyreModelRunner):
 
         # mask not needed during decode
         mask = None
-
-        # add pads for min decode batch size of 2 (Spyre compiler constraint)
-        if len(cached_request_data.req_ids) == 1:
-            padd_seq_indices = torch.zeros(1, dtype=torch.bool, device="cpu")
-            self.model.indices = torch.cat(
-                (self.model.indices, padd_seq_indices), -1)
-            assert self.model.indices.size(dim=0) == 2
-
-            input_tokens = torch.cat(2 * [input_tokens])
-            position_ids = torch.cat(2 * [position_ids])
-            current_tkv_mask = torch.cat(2 * [current_tkv_mask])
-            left_padded_prompt_mask = torch.cat(2 * [left_padded_prompt_mask])
-            block_table = torch.cat(2 * [block_table])
-            slot_mapping = torch.cat(2 * [slot_mapping])
-
-        # assert min batch size 2 for decodes (Spyre compiler constraint)
-        assert len(input_tokens) >= 2
 
         model_inputs = SamplingForwardInputs(
             input_tokens=input_tokens,
@@ -1414,9 +1386,11 @@ class SpyrePoolingModelRunner(WarmupShapesMixin,
         self,
         vllm_config: VllmConfig,
         is_driver_worker: bool,
+        rank: int,
     ):
         super().__init__(vllm_config=vllm_config,
-                         is_driver_worker=is_driver_worker)
+                         is_driver_worker=is_driver_worker,
+                         rank=rank)
 
         # position_ids of all the sequences in current batch
         self._position_ids: torch.Tensor = None
@@ -1431,11 +1405,20 @@ class SpyrePoolingModelRunner(WarmupShapesMixin,
                 normalize=True,
                 softmax=False)
         else:
-            self.pooler = Pooler.for_embed(
-                pooler_config=pooler_config,
-                default_pooling_type=PoolingType.CLS,
-                default_normalize=True,
-                default_softmax=False)
+            # TODO: remove this when we no longer support vllm version pre this
+            # PR https://github.com/vllm-project/vllm/pull/20538 (post v0.10.0)
+            annotations = inspect.getfullargspec(Pooler.for_embed).annotations
+            extra_args = {}
+            if ('default_normalize' in annotations
+                    and 'default_softmax' in annotations):
+                extra_args.update({
+                    'default_normalize': True,
+                    'default_softmax': False
+                })
+            if 'default_pooling_type' in annotations:
+                extra_args['default_pooling_type'] = PoolingType.CLS
+            self.pooler = Pooler.for_embed(pooler_config=pooler_config,
+                                           **extra_args)
 
     def build_input_batch(self) -> PoolingInputBatch:
         return PoolingInputBatch(
@@ -1460,12 +1443,14 @@ class SpyrePoolingModelRunner(WarmupShapesMixin,
                 from torch_sendnn import torch_sendnn  # noqa: F401
             except ImportError:
                 print("WARNING: Disabled: torch_sendnn")
-
-            self.model = torch.compile(
-                self.model,
-                mode="default",
-                dynamic=False,
-                backend=envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND)
+            with utils_spyre.stagger_region(
+                    envs_spyre.VLLM_SPYRE_MAX_LOAD_PROCESSES,
+                    self.parallel_config.world_size, self.rank):
+                self.model = torch.compile(
+                    self.model,
+                    mode="default",
+                    dynamic=False,
+                    backend=envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND)
 
     @property
     def vocab_size(self) -> int:

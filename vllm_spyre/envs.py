@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     # for experimentation purposes.
     VLLM_SPYRE_ENABLE_PROMPT_LOGPROBS: bool = False
     VLLM_SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    VLLM_SPYRE_MAX_LOAD_PROCESSES: int = 0
+    VLLM_SPYRE_WORKER_LOG_REDIRECT_DIR: str = ""
 
 logger = init_logger(__name__)
 
@@ -101,10 +103,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPYRE_VLLM_MODEL":
     lambda: bool(int(os.getenv("VLLM_SPYRE_VLLM_MODEL", "0"))),
 
+    # If set, enables the joining of a new sequence even if its prompt length
+    # is exceeding the tkv of the current decode batch. As this shifts all the
+    # sequences in the decode batch to the right (increasing the tkv), there is
+    # also a potential performance decrease coming with this. The switch allows
+    # to test the feature on realistic workloads before enabling it by default.
+    "VLLM_SPYRE_ENABLE_PREFILL_OPTIMIZATION":
+    lambda: bool(int(os.getenv("VLLM_SPYRE_ENABLE_PREFILL_OPTIMIZATION", "0"))
+                 ),
+
     # Allow vllm-spyre to update env vars related to multi-threading (eg. OMP)
     # based on the detected CPU cores and server configuration
     "VLLM_SPYRE_UPDATE_THREAD_CONFIG":
     lambda: bool(int(os.getenv("VLLM_SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+
+    # If set, limit the number of concurrent processes loading/compiling
+    # large models or models with larger context lengths to limit
+    # memory usage.
+    # Set to 0 to allow any number of processes
+    "VLLM_SPYRE_MAX_LOAD_PROCESSES":
+    lambda: bool(int(os.getenv("VLLM_SPYRE_MAX_LOAD_PROCESSES", "0"))),
+
+    # If set, redirects all stdout and stderr from worker processes to files
+    # within this director. This is useful for debugging card-specific errors
+    # in multi-AIU setups, but should never be enabled in production settings.
+    # This removes all output from stdout and stderr for the worker processes.
+    "VLLM_SPYRE_WORKER_LOG_REDIRECT_DIR":
+    lambda: os.getenv("VLLM_SPYRE_WORKER_LOG_REDIRECT_DIR", ""),
 }
 # --8<-- [end:env-vars-definition]
 

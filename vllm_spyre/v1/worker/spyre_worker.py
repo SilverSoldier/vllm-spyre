@@ -1,10 +1,13 @@
 """A Spyre worker class."""
 import contextlib
+import functools
 import json
 import os
 import platform
 import signal
+import sys
 import time
+from pathlib import Path
 from typing import Optional, Union, cast
 
 import torch
@@ -27,6 +30,8 @@ from vllm.worker.worker_base import WorkerBase
 
 import vllm_spyre.envs as envs_spyre
 import vllm_spyre.perf_metrics as perf_metrics
+import vllm_spyre.utils as utils_spyre
+from vllm_spyre.compat_utils import dataclass_fields
 from vllm_spyre.model_executor.model_loader import spyre_setup
 from vllm_spyre.platform import SpyrePlatform
 from vllm_spyre.v1.worker.spyre_model_runner import (
@@ -40,13 +45,51 @@ logger = init_logger(__name__)
 _inside_warmup_mode = False
 
 
+def new_request_data_builder(
+        req_id: str, prompt_token_ids: list[int],
+        sampling_params: Optional[SamplingParams],
+        pooling_params: Optional[PoolingParams]) -> NewRequestData:
+
+    kwargs = {
+        "req_id": req_id,
+        "prompt_token_ids": prompt_token_ids,
+        "mm_hashes": [],
+        "mm_positions": [],
+        "sampling_params": sampling_params,
+        "pooling_params": pooling_params,
+        "block_ids": [0],  # not actually used
+        "num_computed_tokens": 0,
+        "lora_request": None,
+    }
+    if 'mm_inputs' in dataclass_fields(NewRequestData):
+        kwargs["mm_inputs"] = []
+    else:
+        kwargs["mm_kwargs"] = []
+    return NewRequestData(**kwargs)
+
+
 @contextlib.contextmanager
-def _maybe_warmup_context():
+def _maybe_warmup_context(limit: int, world_size: int, rank: int):
     global _inside_warmup_mode
     warmup_context = contextlib.nullcontext
     if envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND == "sendnn":
         from torch_sendnn import warmup_mode
         warmup_context = warmup_mode
+
+    sendnn_exit = warmup_context.__exit__
+
+    # We wrap warmup_mode's __exit__ method in a stagger region
+    # as it's where the model is actually compiled.
+    def __stagger_exit__(*args, **kwargs):
+        with utils_spyre.stagger_region(limit, world_size, rank):
+            sendnn_exit(*args, **kwargs)
+
+    # Use update_wrapper to make __stagger_exit__ look like a proper instance
+    # method on warmup_context
+    functools.update_wrapper(__stagger_exit__, sendnn_exit)
+    # Replace `warmup_context.__exit__` with our new wrapper
+    warmup_context.__exit__ = __stagger_exit__  # type: ignore[method-assign]
+
     with warmup_context():
         _inside_warmup_mode = True
         yield
@@ -182,6 +225,10 @@ class SpyreWorker(WorkerBaseV1):
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
+
+        # For power-user debugging of spyre logs for tensor parallel ops
+        self.redirect_logs_to_files()
+
         self.perf_metrics = perf_metrics.create_perf_metric_logger(rank)
         if self.parallel_config and is_driver_worker:
             assert rank % self.parallel_config.tensor_parallel_size == 0, \
@@ -195,20 +242,20 @@ class SpyreWorker(WorkerBaseV1):
                   ContinuousBatchingSpyreModelRunner, SpyrePoolingModelRunner, VllmModelStaticSpyreModelRunner]
         if self.is_pooling:
             self.model_runner = SpyrePoolingModelRunner(
-                self.vllm_config, self.is_driver_worker)
+                self.vllm_config, self.is_driver_worker, self.rank)
             self.spyre_warmup_shapes = SpyrePlatform.get_warmup_shapes(
                 self.vllm_config.scheduler_config)
         else:
             if envs_spyre.VLLM_SPYRE_USE_CB:
                 self.model_runner = ContinuousBatchingSpyreModelRunner(
-                    self.vllm_config, self.is_driver_worker)
+                    self.vllm_config, self.is_driver_worker, self.rank)
             else:
                 if envs_spyre.VLLM_SPYRE_VLLM_MODEL:
                     self.model_runner = VllmModelStaticSpyreModelRunner(
                     self.vllm_config, self.is_driver_worker)
                 else:
                     self.model_runner = StaticBatchingSpyreModelRunner(
-                    self.vllm_config, self.is_driver_worker)
+                    self.vllm_config, self.is_driver_worker, self.rank)
                 self.spyre_warmup_shapes = SpyrePlatform.get_warmup_shapes(
                     self.vllm_config.scheduler_config)
         self._env_initialized = False
@@ -252,6 +299,32 @@ class SpyreWorker(WorkerBaseV1):
 
         # A small all_reduce for warmup.
         torch.distributed.all_reduce(torch.zeros(1).cpu())
+
+    def redirect_logs_to_files(self) -> None:
+        """Redirects all stdout and stderr to a rank-specific logfile.
+
+        This is 🌶️🌶️🌶️ for debugging purposes only, after it is invoked there
+        won't be any more logs on stdout or stderr from this worker process.
+        """
+        if envs_spyre.VLLM_SPYRE_WORKER_LOG_REDIRECT_DIR:
+            log_dir = Path(envs_spyre.VLLM_SPYRE_WORKER_LOG_REDIRECT_DIR)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"rank-{self.rank}.log"
+
+            logger.warning("Redirecting all logs to %s", str(log_path))
+
+            # As written, this isn't reversible. This could be made into a
+            # context manager with cleanup, but this is for debug purposes only.
+            # This uses system calls because we need to catch the output of all
+            # the C libraries running in this process under the hood.
+
+            # Open the file for redirection
+            redirected_file = log_path.open("w")
+            redirected_fd = redirected_file.fileno()
+
+            # Redirect stderr and stdout with `dup2`
+            os.dup2(redirected_fd, sys.stderr.fileno())
+            os.dup2(redirected_fd, sys.stdout.fileno())
 
     def init_device(self) -> None:
 
@@ -335,6 +408,10 @@ class SpyreWorker(WorkerBaseV1):
         logger.info("load model took %.3fs", load_model_total_t)
 
     def _warmup_spyre_dynamic_size(self, special_token_ids):
+        # this setting is required to mark a dimension of size 1 as dynamic
+        # for pytorch >= 2.7.1 (needed to support batch size 1 for decodes)
+        from torch.fx.experimental import _config as config
+        config.backed_size_oblivious = True
 
         warmup_start_t = time.time()
 
@@ -352,34 +429,25 @@ class SpyreWorker(WorkerBaseV1):
         valid_token_ids_tensor = torch.tensor(valid_token_ids,
                                               dtype=torch.long,
                                               device=torch.device("cpu"))
-        batch_size = 2
         prompt_len = 42
         num_decode_tokens = 2
 
         # Sample from the valid token ids
         warmup_tokens_tensor = valid_token_ids_tensor[torch.randint(
-            0, len(valid_token_ids_tensor), (batch_size + 1, prompt_len))]
+            0, len(valid_token_ids_tensor), (2, prompt_len))]
 
-        dummy_requests: list[NewRequestData] = [
-            NewRequestData(
-                req_id="warmup-%d" % (i),
-                prompt_token_ids=warmup_tokens_tensor[i].tolist(),
-                mm_inputs=[],
-                mm_hashes=[],
-                mm_positions=[],
-                sampling_params=SamplingParams(max_tokens=num_decode_tokens),
-                pooling_params=None,
-                block_ids=[0],  # not actually used
-                num_computed_tokens=0,
-                lora_request=None,
-            ) for i in range(batch_size + 1)
-        ]
-        add_dummy_request = dummy_requests.pop(-1)
+        warmup_req, deploy_req = (new_request_data_builder(
+            req_id="warmup-%d" % (i),
+            prompt_token_ids=warmup_tokens_tensor[i].tolist(),
+            sampling_params=SamplingParams(max_tokens=num_decode_tokens),
+            pooling_params=None,
+        ) for i in range(2))
 
-        with _maybe_warmup_context():
-            self._dynamic_warmup(dummy_requests=dummy_requests,
+        model_runner.pre_warmup()
+        with _maybe_warmup_context(envs_spyre.VLLM_SPYRE_MAX_LOAD_PROCESSES,
+                                   self.parallel_config.world_size, self.rank):
+            self._dynamic_warmup(request=warmup_req,
                                  prompt_len=prompt_len,
-                                 batch_size=batch_size,
                                  valid_token_ids_tensor=valid_token_ids_tensor)
 
         # warmup_mode completes the graph compilation, but we need to do
@@ -387,9 +455,9 @@ class SpyreWorker(WorkerBaseV1):
         # the necessary operations are included in the graph and will be removed
         # after this execution
         scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=[add_dummy_request],
+            scheduled_new_reqs=[deploy_req],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={add_dummy_request.req_id: prompt_len},
+            num_scheduled_tokens={deploy_req.req_id: prompt_len},
             total_num_scheduled_tokens=prompt_len,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
@@ -401,7 +469,7 @@ class SpyreWorker(WorkerBaseV1):
         )
         logger.info("[WARMUP] Deploying to device...")
         self.execute_model(scheduler_output)
-        self._cleanup_model_runner(request=[add_dummy_request])
+        self._cleanup_model_runner(request=[deploy_req])
 
         model_runner.complete_warmup()
 
@@ -468,16 +536,11 @@ class SpyreWorker(WorkerBaseV1):
 
         # Set up dummy requests for prefill steps
         dummy_requests = [
-            NewRequestData(req_id="warmup",
-                           prompt_token_ids=warmup_tokens_tensor[i].tolist(),
-                           mm_inputs=[],
-                           mm_hashes=[],
-                           mm_positions=[],
-                           sampling_params=sampling_params,
-                           pooling_params=pooling_params,
-                           block_ids=[0],
-                           num_computed_tokens=0,
-                           lora_request=None) for i in range(batch_size)
+            new_request_data_builder(
+                req_id="warmup",
+                prompt_token_ids=warmup_tokens_tensor[i].tolist(),
+                sampling_params=sampling_params,
+                pooling_params=pooling_params) for i in range(batch_size)
         ]
 
         # Set up dummy cached_requests for decode steps
@@ -522,7 +585,8 @@ class SpyreWorker(WorkerBaseV1):
         # First full forward pass
         logger.info("[WARMUP] Compiling graphs...")
         # The fixed size warmup needs to happen only in here
-        with _maybe_warmup_context():
+        with _maybe_warmup_context(envs_spyre.VLLM_SPYRE_MAX_LOAD_PROCESSES,
+                                   self.parallel_config.world_size, self.rank):
             self._warmup_model_forward_pass(scheduler_output, dummy_requests,
                                             cached_request_data,
                                             num_decode_tokens)
@@ -555,9 +619,8 @@ class SpyreWorker(WorkerBaseV1):
 
     def _dynamic_warmup(
         self,
-        dummy_requests: list[NewRequestData],
+        request: NewRequestData,
         prompt_len: int,
-        batch_size: int,
         valid_token_ids_tensor: torch.Tensor,
     ) -> None:
 
@@ -565,51 +628,39 @@ class SpyreWorker(WorkerBaseV1):
             _inside_warmup_mode
         ), "it looks like you are outside the warmup context for warmup"
 
-        for i, req in enumerate(dummy_requests):
-            scheduler_output = SchedulerOutput(
-                scheduled_new_reqs=[req],
-                scheduled_cached_reqs=CachedRequestData.make_empty(),
-                num_scheduled_tokens={req.req_id: prompt_len},
-                total_num_scheduled_tokens=prompt_len,
-                scheduled_spec_decode_tokens={},
-                scheduled_encoder_inputs={},
-                num_common_prefix_blocks=0,
-                finished_req_ids=set(),
-                free_encoder_input_ids=[],
-                structured_output_request_ids={},
-                grammar_bitmask=None,
-            )
-            logger.info("[WARMUP] Prefill %d/%d...", i + 1, batch_size)
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[request],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={request.req_id: prompt_len},
+            total_num_scheduled_tokens=prompt_len,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=0,
+            finished_req_ids=set(),
+            free_encoder_input_ids=[],
+            structured_output_request_ids={},
+            grammar_bitmask=None,
+        )
+        logger.info("[WARMUP] Prefill...")
 
-            self.execute_model(scheduler_output)
+        self.execute_model(scheduler_output)
 
-        # one decode iteration across all sequences
-        req_ids = []
-        new_token_ids = []
-        new_block_ids = []
-        num_computed_tokens = []
-        for req in dummy_requests:
-            req_ids.append(req.req_id)
-            new_token_ids.append([
+        cached_request_data = CachedRequestData(
+            req_ids=[request.req_id],
+            resumed_from_preemption=False,
+            new_token_ids=[[
                 valid_token_ids_tensor[torch.randint(
                     0, len(valid_token_ids_tensor), (1, )).item()]
-            ])  # placeholder token
-            new_block_ids.append([req.block_ids])
-            num_computed_tokens.append(prompt_len)
-        cached_request_data = CachedRequestData(
-            req_ids=req_ids,
-            resumed_from_preemption=False,
-            new_token_ids=new_token_ids,
-            new_block_ids=new_block_ids,
-            num_computed_tokens=num_computed_tokens,
+            ]],
+            new_block_ids=[request.block_ids],
+            num_computed_tokens=[prompt_len],
         )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=cached_request_data,
-            num_scheduled_tokens={f"warmup-{i}": 1
-                                  for i in range(batch_size)},
-            total_num_scheduled_tokens=batch_size,
+            num_scheduled_tokens={request.req_id: 1},
+            total_num_scheduled_tokens=1,
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=0,
@@ -620,7 +671,7 @@ class SpyreWorker(WorkerBaseV1):
         )
         logger.info("[WARMUP] Decode...")
         self.execute_model(scheduler_output)
-        self._cleanup_model_runner(request=dummy_requests)
+        self._cleanup_model_runner(request=[request])
 
     def _warmup_model_forward_pass(
         self,
