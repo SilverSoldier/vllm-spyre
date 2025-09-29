@@ -7,8 +7,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils import is_pin_memory_available, make_tensor_with_pad
-from vllm.v1.sample.logits_processor import (BatchUpdateBuilder,
-                                             init_builtin_logitsprocs)
+from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_spyre.v1.worker.spyre_input_batch import (SamplingInputBatch,
@@ -64,20 +63,11 @@ def _construct_expected_sampling_metadata(
                                          dtype=torch.bool,
                                          device=device)
 
-    batch_update_builder = BatchUpdateBuilder()
-    logitsprocs = init_builtin_logitsprocs(pin_memory_available=False,
-                                           max_num_reqs=len(reqs) + 1,
-                                           device=device)
-
     bad_words_token_ids = {}
     for req in reqs:
         if req.req_id not in req_ids_retained:
             continue
         index_in_input_batch = input_batch.req_id_to_dense_index(req.req_id)
-
-        params = req.sampling_params
-        batch_update_builder.added.append(
-            (index_in_input_batch, params, req.output_token_ids))
 
         output_token_ids[index_in_input_batch] = req.output_token_ids
         prompt_token_ids[index_in_input_batch] = req.prompt_token_ids
@@ -96,10 +86,6 @@ def _construct_expected_sampling_metadata(
         if req.sampling_params.bad_words_token_ids:
             bad_words_token_ids[
                 index_in_input_batch] = req.sampling_params.bad_words_token_ids
-
-    batch_update = batch_update_builder.get_and_reset(num_reqs)
-    for logit_proc in logitsprocs.all:
-        logit_proc.update_state(batch_update)
 
     return SamplingMetadata(
         temperature=torch.tensor(temperature, dtype=torch.float,
@@ -133,7 +119,7 @@ def _construct_expected_sampling_metadata(
                       and all(x == 1 for x in repetition_penalties)),
         allowed_token_ids_mask=allowed_token_ids_mask,
         bad_words_token_ids=bad_words_token_ids,
-        logitsprocs=logitsprocs,
+        logitsprocs=LogitsProcessors(),
     )
 
 

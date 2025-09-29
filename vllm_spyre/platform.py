@@ -1,4 +1,3 @@
-import inspect
 import sys
 
 # When running this plugin on a Mac, we assume it's for local development
@@ -14,7 +13,7 @@ if sys.platform.startswith("darwin"):
 import math
 import operator
 import os
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 from vllm.inputs import ProcessorInputs, PromptType
@@ -31,6 +30,7 @@ import vllm.envs as envs
 from vllm.platforms import Platform, PlatformEnum, _Backend
 
 import vllm_spyre.envs as envs_spyre
+from vllm_spyre.compilation_utils import handle_disable_compilation
 
 logger = init_logger(__name__)
 
@@ -44,23 +44,12 @@ THREADING_ENVS = [
 ]
 
 
-class classproperty:
+# Needed by vllm/model_executor/layers/pooler.py:562
+# Copied from vllm/utils/__init__.py
+class _StreamPlaceholder:
 
-    def __init__(self, func):
-        self.func = func
-
-    def __get__(self, instance, owner):
-        return self.func(owner)
-
-
-@property  # type: ignore
-def is_v1_compatible(self) -> bool:
-    architectures = getattr(self.hf_config, "architectures", [])
-    patterns = ["Bert", "Roberta"]
-    if any(pat in arch for arch in architectures for pat in patterns):
-        return True
-    import vllm.model_executor.models as me_models
-    return me_models.ModelRegistry.is_v1_compatible(architectures)
+    def __init__(self):
+        self.synchronize = lambda: None
 
 
 class SpyrePlatform(Platform):
@@ -68,34 +57,28 @@ class SpyrePlatform(Platform):
 
     # "spyre" device_name no longer worked due to https://github.com/vllm-project/vllm/pull/16464
     device_name: str = "cpu"
-    _device_type: str = "cpu"
+    device_type: str = "cpu"
     # compressed-tensors supported by
     # https://github.com/foundation-model-stack/fms-model-optimizer/blob/main/fms_mo/aiu_addons/__init__.py
     supported_quantization: list[str] = ["gptq", "compressed-tensors"]
-    _warmup_shapes: Optional[tuple[dict[str, int], ...]] = None
+    _warmup_shapes: tuple[dict[str, int], ...] | None = None
     _block_size: int = 64  # hardcoded Spyre constraint for now
     _num_spyre_blocks_override: int = -1  # override num of KV cache blocks
     _config: VllmConfig = None
 
-    @classproperty
-    def device_type(cls):
-        # TODO: temporary hack while BertModels
-        # inherit SupportsV0Only in vllm upstream.
-        import vllm.model_executor.models as me_models
-        from vllm.config import ModelConfig
+    # Backend for dynamic compilation ops
+    # See vllm batched_count_greater_than method
+    simple_compile_backend: str = envs_spyre.VLLM_SPYRE_SIMPLE_COMPILE_BACKEND
 
-        # no need to patch after the model_config change
-        if 'model_config' not in \
-                inspect.getfullargspec(me_models.ModelRegistry.is_v1_compatible).args:
-            ModelConfig.is_v1_compatible = is_v1_compatible
-        return cls._device_type
+    # Needed by vllm/model_executor/layers/pooler.py:562
+    current_stream = lambda _: _StreamPlaceholder()
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "spyre"
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
+    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         """
         Check if the current platform supports async output.
         """
@@ -107,6 +90,14 @@ class SpyrePlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+
+        # In case vllm passes a default vllm_config to us.
+        # This happens when get_current_vllm_config is called
+        # without setting the vllm config through
+        # set_current_vllm_config
+        if vllm_config.model_config is None:
+            return
+
         cls._config = vllm_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -119,24 +110,15 @@ class SpyrePlatform(Platform):
         compilation_config.pass_config.enable_attn_fusion = False
         compilation_config.level = CompilationLevel.NO_COMPILATION
 
-        if getattr(scheduler_config, "is_multi_step", False):
-            raise NotImplementedError
+        is_decoder = model_config.runner_type == "generate"
 
-        # Can be simplified after the deprecation of `model_config.task` in
-        # vllm > 0.10.0
-        is_decoder = "generate" in model_config.supported_tasks if (
-            model_config.task == "auto"
-            or model_config.task is None) else model_config.task == "generate"
-
-        is_pooling = "embed" in model_config.supported_tasks if (
-            model_config.task == "auto"
-            or model_config.task is None) else model_config.task == "embed"
+        is_pooling = model_config.runner_type == "pooling"
 
         if not bool(int(os.getenv("VLLM_USE_V1", "1"))):
             raise ValueError("vllm-spyre is only supported with vLLM v1. "
                              "Please set VLLM_USE_V1=1")
         elif not is_decoder and not is_pooling:
-            raise ValueError("Only the 'generate' and 'embed' tasks are "
+            raise ValueError("Only the 'generate' and 'pooling' runners are "
                              "supported")
 
         if parallel_config.worker_cls == "auto":
@@ -159,14 +141,16 @@ class SpyrePlatform(Platform):
             if envs_spyre.VLLM_SPYRE_ENABLE_PROMPT_LOGPROBS:
                 raise ValueError("Prompt logprobs not supported with " \
                 "continuous batching")
+            if (vllm_config.model_config.quantization
+                    and vllm_config.scheduler_config.max_num_seqs == 1):
+                raise ValueError(
+                    "Batch size 1 not supported for fp8 continuous batching.")
         else:
             # Static batching or embedding model.
             # Override --max-num-seqs to the biggest warmup batch size
             # And override --max-model-len to the biggest warmup sequence
             cls._warmup_shapes = None
-            max_model_len = model_config.max_model_len
-            spyre_warmup_shapes = cls.get_warmup_shapes(
-                scheduler_config, max_model_len)
+            spyre_warmup_shapes = cls.get_warmup_shapes(scheduler_config)
             max_batch_size = 0
             max_seq_len = 0
             for shape in spyre_warmup_shapes:
@@ -179,6 +163,10 @@ class SpyrePlatform(Platform):
                 raise ValueError(
                     "Prompt logprobs only supported with batch size 1")
 
+            # verify that warmup shapes are not too large
+            model_config.get_and_verify_max_len(max_model_len=max_seq_len)
+
+            # override stuff
             model_config.max_model_len = max_seq_len
             scheduler_config.max_num_seqs = max_batch_size
 
@@ -241,6 +229,14 @@ class SpyrePlatform(Platform):
             logger.info("Model granite-3.3-8b-instruct and tensor parallel " \
             "size 4 detected. Using VLLM_DT_MAX_BATCH_TKV_LIMIT = %d",
             128 * 1024)
+
+            # If no HDMA p2psize override was specified, set 256MB
+            if not os.getenv("FLEX_HDMA_P2PSIZE", None):
+                os.environ["FLEX_HDMA_P2PSIZE"] = str(1024 * 1024 * 256)
+                logger.info(
+                    "Model granite-3.3-8b-instruct and tensor parallel size 4 "
+                    "detected. Using FLEX_HDMA_P2PSIZE = %d",
+                    1024 * 1024 * 256)
         else:
             # default value for any other model/ tensor parallel size
             default_max_batch_tkv_limit = \
@@ -251,6 +247,22 @@ class SpyrePlatform(Platform):
             logger.info("No model / tensor parallel size specific value for " \
             "VLLM_DT_MAX_BATCH_TKV_LIMIT found. Using the default value " \
             "(max_model_len * max_batch_size): %d", default_max_batch_tkv_limit)
+
+        # scheduling heuristic: prefill vs decode prioritization
+        if envs_spyre.VLLM_SPYRE_N_TOKENS_PREFILL_PRIO == -1:
+            logger.info(
+                "Env var VLLM_SPYRE_N_TOKENS_PREFILL_PRIO for prefill/decode "
+                "balancing unset. Defaulting to -1, which always prioritizes "
+                "prefills (no scheduler heuristic/ balancing at all).")
+        else:
+            logger.info(
+                "Env var VLLM_SPYRE_N_TOKENS_PREFILL_PRIO for prefill/decode "
+                "balancing is set to %s. This means that prefills using up to "
+                " %s tokens will always be prioritized over decodes.",
+                envs_spyre.VLLM_SPYRE_N_TOKENS_PREFILL_PRIO,
+                envs_spyre.VLLM_SPYRE_N_TOKENS_PREFILL_PRIO)
+
+        handle_disable_compilation(vllm_config, is_decoder)
 
     @classmethod
     def use_all_gather(cls) -> bool:
@@ -267,16 +279,13 @@ class SpyrePlatform(Platform):
     @classmethod
     def inference_mode(cls):
         """
-        Spyre does not support `torch.inference_mode`. 
+        Spyre does not support `torch.inference_mode`.
         This allows to fall back to `torch.no_grad` when inference mode is set.
         """
         return torch.no_grad()
 
     @classmethod
-    def get_warmup_shapes(
-            cls,
-            scheduler_config,
-            max_model_len: int = sys.maxsize) -> tuple[dict[str, int], ...]:
+    def get_warmup_shapes(cls, scheduler_config) -> tuple[dict[str, int], ...]:
         if cls._warmup_shapes is not None:
             return cls._warmup_shapes
         # load warmup shapes and sort by "speed"
@@ -312,16 +321,6 @@ class SpyrePlatform(Platform):
             } for pl, nt, bs in zip(wup_prompt_lens, wup_new_tokens,
                                     wup_batch_sizes)],
                    key=operator.itemgetter('batch_size', 'prompt_length')))
-
-        for shape in cls._warmup_shapes:
-            max_seq_len = shape["prompt_length"] + shape["new_tokens"]
-            if max_seq_len > max_model_len:
-                raise RuntimeError(
-                    f"Warmup shape [{shape['batch_size']},"
-                    f" {shape['prompt_length']}, {shape['new_tokens']}]"
-                    f" results in a maximum sequence length of "
-                    f"{max_seq_len} which is longer that what the model "
-                    f"supports ({max_model_len})")
         return cls._warmup_shapes
 
     @classmethod
@@ -344,7 +343,7 @@ class SpyrePlatform(Platform):
         cls,
         prompt: PromptType,
         params: Union[SamplingParams, PoolingParams],
-        processed_inputs: Optional[ProcessorInputs] = None,
+        processed_inputs: ProcessorInputs | None = None,
     ) -> None:
         """Raises if this request is unsupported on this platform"""
         if isinstance(params, PoolingParams):
@@ -441,7 +440,7 @@ class SpyrePlatform(Platform):
             ' '.join([f"{env}={value}" for env, value in env_map.items()]))
 
         # Try to determine the CPU time/cores that we are allocated
-        cpu_count: Optional[float] = None
+        cpu_count: float | None = None
         detection_message = ""
         try:
             # try to query cgroup CPU limits

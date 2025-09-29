@@ -12,9 +12,10 @@ import torch
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.pool.metadata import PoolingMetadata
+# from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.logits_processor import (BatchUpdateBuilder,
-                                             MoveDirectionality,
-                                             init_builtin_logitsprocs)
+                                             LogitsProcessors,
+                                             MoveDirectionality)
 from vllm.v1.sample.metadata import SamplingMetadata
 
 
@@ -229,7 +230,10 @@ class SamplingInputBatch(BaseInputBatch[SamplingRequestState]):
         device: torch.device,
         pin_memory: bool,
         vocab_size: int,
+        # Type here is any for compatibility reasons
+        logitsprocs: Optional[LogitsProcessors] = None,
     ):
+
         super().__init__(
             max_num_reqs,
             max_model_len,
@@ -297,13 +301,7 @@ class SamplingInputBatch(BaseInputBatch[SamplingRequestState]):
         # updates. Should reset each step.
         self.batch_update_builder = BatchUpdateBuilder()
 
-        # Define logits processors.
-        # TODO(andy): logits processor list should be extensible via engine
-        # constructor argument; for now the list is fixed.
-        self.logitsprocs = init_builtin_logitsprocs(pin_memory_available=False,
-                                                    max_num_reqs=max_num_reqs +
-                                                    1,
-                                                    device=device)
+        self.logitsprocs = logitsprocs or LogitsProcessors()
 
         self.has_allowed_token_ids: set[str] = set()
         self.allowed_token_ids_mask: Optional[torch.Tensor] = None
@@ -399,7 +397,8 @@ class SamplingInputBatch(BaseInputBatch[SamplingRequestState]):
         params = request.sampling_params  # TODO add pooling params
         tmp_dense = self.num_reqs - 1
         self.batch_update_builder.added.append(
-            (tmp_dense, params, request.output_token_ids))
+            (tmp_dense, params, request.prompt_token_ids,
+             request.output_token_ids))
 
         while tmp_dense > dense_index:
             self.batch_update_builder.moved.append(
@@ -672,6 +671,10 @@ class SamplingInputBatch(BaseInputBatch[SamplingRequestState]):
     @property
     def no_allowed_token_ids(self) -> bool:
         return len(self.has_allowed_token_ids) == 0
+
+    @property
+    def request_indices(self) -> list[int]:
+        return self.req_indices_mask.nonzero().reshape(-1).tolist()
 
 
 @dataclass
