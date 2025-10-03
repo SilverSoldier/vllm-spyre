@@ -239,7 +239,7 @@ class SpyreWorker(WorkerBaseV1):
             else:
                 if envs_spyre.VLLM_SPYRE_VLLM_MODEL:
                     self.model_runner = VllmModelStaticSpyreModelRunner(
-                    self.vllm_config, self.is_driver_worker)
+                        self.vllm_config, self.is_driver_worker, self.rank)
                 else:
                     self.model_runner = StaticBatchingSpyreModelRunner(
                     self.vllm_config, self.is_driver_worker, self.rank)

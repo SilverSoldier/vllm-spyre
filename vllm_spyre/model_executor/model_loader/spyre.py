@@ -88,6 +88,7 @@ class SpyreCausalLM(nn.Module):
                     vllm_config,
                     max_prompt_length,
                     max_decode_length,
+                    rank,
             )
         else:
             self.model = StaticBatchingFmsModel(
@@ -754,13 +755,15 @@ class StaticBatchingVllmModel(FmsModelBase):
         vllm_config: VllmConfig,
         max_prompt_length: int,
         max_decode_length: int,
+        rank:int,
     ) -> None:
         super().__init__(vllm_config.model_config,
                     vllm_config.parallel_config,
                     max_prompt_length,
                     max_decode_length,
                     sendnn_dynamic=False,
-                    vllm_config=vllm_config)
+                    vllm_config=vllm_config,
+                    rank=rank)
 
     def forward(
         self,
@@ -769,12 +772,18 @@ class StaticBatchingVllmModel(FmsModelBase):
         **extra_kwargs,
     ) -> torch.Tensor:
 
-
-        #output = self.model(input_ids, positions=position_ids,)
-
-        return input_ids
+        output = self.model(input_ids, positions=position_ids,)
+        return output
 
     def compute_logits(self,
             hidden_states: torch.Tensor,
             sampling_metadata: SamplingMetadata) -> Optional[torch.Tensor]:
-        return self.model.compute_logits(hidden_states,
+        return self.model.compute_logits(hidden_states, sampling_metadata)
+
+    def get_dtype(self) -> torch.dtype:
+        # For static batching, we set fp16 on spyre and fp32 on cpu
+        # (This applies even when running fp8 quantized models)
+        if envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND in BACKEND_LIST:
+            return torch.float16
+        else:
+            return torch.float32

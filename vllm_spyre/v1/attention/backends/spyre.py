@@ -85,7 +85,7 @@ class SpyreSDPAMetadataBuilder(AttentionMetadataBuilder[SpyreSDPAMetadata]):
         num_tokens = len(data.input_tokens)
         is_prefill = data.is_prompt
         bsize = len(data.input_positions)
-        past_token = [0 for _ in bsize]
+        past_token = 0 #[0 * bsize]
         # TODO: Handle batch sizes later
         if not is_prefill:
             past_token = data.input_masks.shape[2] - 1 # bsize x qsize x kvsize
@@ -136,11 +136,11 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         if blocksparse_params is not None:
             raise NotImplementedError("Blocksparse is not supported.")
         self.attn_type = attn_type
-        if attn_type != AttentionType.DECODER:
-            raise NotImplementedError("Encoder self-attention and "
-                                      "encoder/decoder cross-attention "
-                                      "are not implemented for "
-                                      "SpyreSDPABackendImpl")
+        # if attn_type != AttentionType.DECODER:
+        #     print("Encoder self-attention and "
+        #                               "encoder/decoder cross-attention "
+        #                               "are not implemented for "
+        #                               "SpyreSDPABackendImpl")
 
         self.sdpa_compute_prefill = self._sdpa_compute_op
         self.sdpa_compute_decode = self._sdpa_compute_op
@@ -156,8 +156,9 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         values = values.transpose(2, 1)
 
         if key_cache is not None and value_cache is not None and value_cache.numel() > 0:
-            key_cache_result = torch.cat((key_cache, keys), dim=2)
-            value_cache_result = torch.cat((value_cache, values), dim=2)
+            #print(f"{keys.shape}, {key_cache.shape}")
+            key_cache_result = torch.cat((key_cache, keys), dim=2).to(dtype=keys.dtype)
+            value_cache_result = torch.cat((value_cache, values), dim=2).to(dtype=keys.dtype)
             return (
                 key_cache_result,
                 value_cache_result,
@@ -183,8 +184,8 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
             key_cache = key_cache.transpose(2, 1)
             value_cache = value_cache.transpose(2, 1)
-        mask = attn_metadata.masks
 
+        mask = attn_metadata.masks
         if mask is not None:
             while len(mask.size()) != 4:
                 mask = mask.unsqueeze(1)
@@ -205,6 +206,8 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
 
         is_causal = attn_metadata.is_prefill and (mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1))
 
+        # print(queries.shape)
+        # print(keys_e.shape)
         attn = F.scaled_dot_product_attention(
             queries,
             keys_e,
@@ -214,6 +217,12 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
             is_causal=is_causal,
             scale=scale_factor,
         )
+
+        # DEBUG 
+        # attn_weight = queries @ keys_e.transpose(-2, -1) * 0.1
+        # attn_weight = torch.softmax(attn_weight, dim=-1)
+        # attn = attn_weight @ values_e
+        # attn = queries
 
         # attn: bs x seq_len x nheads*emb_v_per_head
         # attn: b x h x qlen x ds
@@ -248,8 +257,8 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         queries = query.view(bsize, -1, self.num_heads, self.head_size)
         q_len = query.shape[1]
 
-        keys = key.view(bsize, q_len, self.num_kv_heads, self.head_size).to(dtype=queries.dtype)
-        values = value.view(bsize, q_len, self.num_kv_heads, self.head_size).to(dtype=queries.dtype)
+        keys = key.view(bsize, -1, self.num_kv_heads, self.head_size).to(dtype=queries.dtype)
+        values = value.view(bsize, -1, self.num_kv_heads, self.head_size).to(dtype=queries.dtype)
 
         past_token = attn_metadata.past_token
         if attn_metadata.is_prefill:
@@ -265,6 +274,7 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
                 past_key_value_state[1],
             )
         )
+        #keys_compute, values_compute = keys, values # DEBUG
 
         if attn_metadata.is_prefill:
             attn = self.sdpa_compute_prefill(
@@ -292,8 +302,9 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         attn = attn.view(-1, self.num_heads * self.head_size)
 
         # Store back KV cache
-        # kv_len = keys_return.shape[2]
-        # kv_cache[0,:,:,:kv_len,:] = keys_return
-        # kv_cache[1,:,:,:kv_len,:] = values_return
+
+        kv_len = keys_return.shape[2]
+        kv_cache[0,:,:,:kv_len,:] = keys_return
+        kv_cache[1,:,:,:kv_len,:] = values_return
 
         return attn

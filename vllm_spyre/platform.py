@@ -13,7 +13,7 @@ if sys.platform.startswith("darwin"):
 import math
 import operator
 import os
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Union, Optional
 
 import torch
 from vllm.inputs import ProcessorInputs, PromptType
@@ -84,7 +84,7 @@ class SpyrePlatform(Platform):
         """
         return False
 
-    def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int, dtype: torch.dtype, kv_cache_dtype: Optional[str], block_size: int, use_v1: bool, use_mla: bool) -> str:
+    def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int, dtype: torch.dtype, kv_cache_dtype: Optional[str], block_size: int, use_v1: bool, use_mla: bool, has_sink: bool=False) -> str:
         logger.info("Using Torch SDPA backend.")
         return ("vllm_spyre.v1.attention.backends.spyre.SpyreSDPABackend")
 

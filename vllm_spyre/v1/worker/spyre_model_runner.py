@@ -526,8 +526,8 @@ class SpyreModelRunner(BaseSpyreModelRunner[SamplingInputBatch,
                                        is_prompt=model_input.is_prompt)
 
         # Compute the logits.
-        # if self.vllm_model_impl:
-        #     hidden_states =  hidden_states[:, -1, :] # Get last token of every batch
+        if envs_spyre.VLLM_SPYRE_VLLM_MODEL:
+            hidden_states =  hidden_states[:, -1, :] # Get last token of every batch
         logits = self.model.compute_logits(hidden_states, None)
 
         is_prefill = cast(bool, model_input.is_prompt)
@@ -1334,9 +1334,10 @@ class VllmModelStaticSpyreModelRunner(StaticBatchingSpyreModelRunner):
             self,
             vllm_config: VllmConfig,
             is_driver_worker: bool,
+            rank: int,
             ):
         super().__init__(vllm_config=vllm_config,
-                         is_driver_worker=is_driver_worker)
+                         is_driver_worker=is_driver_worker, rank=rank)
         self.vllm_model_impl=True
         self.attn_backend = SpyreSDPABackend
         self.attn_metadata_builder = SpyreSDPABackend.get_builder_cls()()
