@@ -4,7 +4,7 @@ Run `python -m pytest tests/e2e/test_spyre_basic.py`.
 """
 
 import pytest
-from output_util import check_output_against_hf, generate_spyre_vllm_output
+from output_util import validate_vllm_vs_hf_output
 from spyre_util import (DecodeWarmupShapes, ModelInfo, create_random_request,
                         get_chicken_soup_prompts, patch_environment,
                         skip_unsupported_tp_size)
@@ -53,53 +53,15 @@ def test_output(model: ModelInfo, tp_size: int, backend: str, cb: int,
         logprobs=0,  # return logprobs of generated tokens only
         ignore_eos=True)
 
-    vllm_results = generate_spyre_vllm_output(
-        model=model,
-        prompts=prompts,
-        sampling_params=vllm_sampling_params,
-        tensor_parallel_size=tp_size,
-        backend=backend,
-        monkeypatch=monkeypatch,
-        max_model_len=max_model_len,
-        **kwargs)
-    check_output_against_hf(model, backend, max_new_tokens, vllm_results,
-                            prompts)
-
-
-@pytest.mark.parametrize("backend", [
-    pytest.param(
-        "sendnn_decoder", marks=pytest.mark.spyre, id="sendnn_decoder")
-])
-def test_output_sendnn_decoder(model: ModelInfo,
-                               warmup_shapes: DecodeWarmupShapes, backend: str,
-                               monkeypatch: pytest.MonkeyPatch,
-                               use_llm_cache) -> None:
-    '''
-    Tests the deprecated sendnn_decoder backend, which should fall-back to
-    sendnn
-    '''
-
-    max_new_tokens = warmup_shapes[0][1]
-    prompts = get_chicken_soup_prompts(1)
-
-    vllm_sampling_params = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=0,
-        logprobs=0,  # return logprobs of generated tokens only
-        ignore_eos=True)
-
-    vllm_results = generate_spyre_vllm_output(
-        model=model,
-        prompts=prompts,
-        warmup_shapes=warmup_shapes,
-        max_model_len=2048,
-        sampling_params=vllm_sampling_params,
-        tensor_parallel_size=1,
-        backend=backend,
-        monkeypatch=monkeypatch)
-
-    check_output_against_hf(model, backend, max_new_tokens, vllm_results,
-                            prompts)
+    validate_vllm_vs_hf_output(model=model,
+                               prompts=prompts,
+                               sampling_params=vllm_sampling_params,
+                               tensor_parallel_size=tp_size,
+                               backend=backend,
+                               monkeypatch=monkeypatch,
+                               max_model_len=max_model_len,
+                               max_new_tokens=max_new_tokens,
+                               **kwargs)
 
 
 def test_batch_handling(model: ModelInfo, backend: str, cb: int, warmup_shapes,
@@ -134,18 +96,15 @@ def test_batch_handling(model: ModelInfo, backend: str, cb: int, warmup_shapes,
         "warmup_shapes": warmup_shapes
     }
 
-    vllm_results = generate_spyre_vllm_output(
-        model=model,
-        prompts=prompts,
-        max_model_len=256,
-        sampling_params=vllm_sampling_params,
-        tensor_parallel_size=1,
-        backend=backend,
-        monkeypatch=monkeypatch,
-        **kwargs)
-
-    check_output_against_hf(model, backend, max_new_tokens, vllm_results,
-                            prompts)
+    validate_vllm_vs_hf_output(model=model,
+                               prompts=prompts,
+                               max_model_len=max_model_len,
+                               sampling_params=vllm_sampling_params,
+                               tensor_parallel_size=1,
+                               backend=backend,
+                               monkeypatch=monkeypatch,
+                               max_new_tokens=max_new_tokens,
+                               **kwargs)
 
 
 def test_full_batch_scheduling(model: ModelInfo, backend: str, monkeypatch):
@@ -193,7 +152,7 @@ def test_full_batch_scheduling(model: ModelInfo, backend: str, monkeypatch):
                 request_id=i,
                 num_tokens=max_batched_tokens,
                 sampling_params=vllm_sampling_params,
-                model=model.name,
+                model=model,
             ))
     schedule = scheduler.schedule()
 
@@ -217,7 +176,8 @@ def test_max_model_len_override(model: ModelInfo, backend, warmup_shapes, cb,
 
     patch_environment(**kwargs, backend=backend, monkeypatch=monkeypatch)
     vllm_config = EngineArgs(
-        model=model.name, max_model_len=max_model_len).create_engine_config()
+        model=model.name, revision=model.revision,
+        max_model_len=max_model_len).create_engine_config()
     model_config = vllm_config.model_config
 
     if not cb:

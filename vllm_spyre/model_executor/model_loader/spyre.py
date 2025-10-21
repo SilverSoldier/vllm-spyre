@@ -9,15 +9,15 @@ import torch.distributed as dist
 import torch.nn as nn
 from fms.models import get_model
 from transformers import PretrainedConfig
-from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf)
 from vllm.model_executor.model_loader import get_model as vllm_get_model
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 import vllm_spyre.envs as envs_spyre
 import vllm_spyre.utils as utils_spyre
@@ -53,18 +53,18 @@ class SpyreCausalLM(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
         max_prompt_length: int,
         max_decode_length: int,
         rank: int,
     ) -> None:
         super().__init__()
 
-        self.logits_processor = LogitsProcessor(
-            model_config.hf_config.vocab_size, logits_as_input=True)
-        self.sampler = get_sampler()
+        try:
+            ## Temporary backwards compatibility for 0.10.2
+            from vllm.model_executor.layers.sampler import get_sampler
+            self.sampler = get_sampler()
+        except (ImportError, ModuleNotFoundError):
+            self.sampler = Sampler()
 
         # boolean tensor of length batch size with indices:
         # True for unfinished sequences and
@@ -80,9 +80,7 @@ class SpyreCausalLM(nn.Module):
 
         # FMS Model
         if envs_spyre.VLLM_SPYRE_USE_CB:
-            self.model = ContinuousBatchingFmsModel(model_config,
-                                                    parallel_config,
-                                                    scheduler_config, rank)
+            self.model = ContinuousBatchingFmsModel(vllm_config, rank)
         elif envs_spyre.VLLM_SPYRE_VLLM_MODEL:
             self.model= StaticBatchingVllmModel(
                     vllm_config,
@@ -92,9 +90,7 @@ class SpyreCausalLM(nn.Module):
             )
         else:
             self.model = StaticBatchingFmsModel(
-                model_config,
-                parallel_config,
-                scheduler_config,
+                vllm_config,
                 max_prompt_length,
                 max_decode_length,
                 rank,
@@ -167,8 +163,7 @@ class FmsModelBase(nn.Module):
 
     def __init__(
         self,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
+        vllm_config: VllmConfig,
         max_prompt_length: int,
         max_decode_length: int,
         rank: int,
@@ -178,23 +173,26 @@ class FmsModelBase(nn.Module):
         super().__init__()
 
         self.vllm_config = vllm_config
-        self.config: PretrainedConfig = model_config.hf_config
+        self.config: PretrainedConfig = vllm_config.model_config.hf_config
 
         # Actual FMS model
         self.model: nn.Module
-        self.model_config = model_config
+        self.model_config = vllm_config.model_config
+        self.parallel_config = vllm_config.parallel_config
+        self.cache_config = vllm_config.cache_config
+        self.scheduler_config = vllm_config.scheduler_config
         self.dtype = self.get_dtype()
 
         # Load the weights from the cached or downloaded files.
         self.load_weights(
-            model_config=model_config,
+            model_config=self.model_config,
             max_prompt_length=max_prompt_length,
             max_decode_length=max_decode_length,
             distributed_strategy="tp"
-            if parallel_config.world_size > 1 else None,
+            if self.parallel_config.world_size > 1 else None,
             sendnn_dynamic=sendnn_dynamic,
             rank=rank,
-            world_size=parallel_config.world_size,
+            world_size=self.parallel_config.world_size,
         )
 
     def load_weights(
@@ -341,14 +339,11 @@ class ContinuousBatchingFmsModel(FmsModelBase):
 
     def __init__(
         self,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
+        vllm_config: VllmConfig,
         rank: int,
     ) -> None:
-
         BLOCK_SIZE = SpyrePlatform.get_block_size()
-        max_model_len = scheduler_config.max_model_len
+        max_model_len = vllm_config.scheduler_config.max_model_len
 
         # edge case: prompt fills model length: can produce 1 token with prefill
         max_prompt_length = max_model_len
@@ -356,27 +351,26 @@ class ContinuousBatchingFmsModel(FmsModelBase):
         # can produce 1 token with prefill plus rest of model length
         max_decode_length = max_model_len - BLOCK_SIZE + 1
 
-        super().__init__(model_config,
-                         parallel_config,
+        super().__init__(vllm_config,
                          max_prompt_length,
                          max_decode_length,
                          rank,
                          sendnn_dynamic=True)
 
-        self.scheduler_config = scheduler_config
-        self.parallel_config = parallel_config
         self.prefill_past_key_values = None
 
         # physical KV cache on AIU Spyre: will eventually not live in this class
         self.kv_cache_specs = {}
         self.kv_cache_specs['block_size'] = BLOCK_SIZE
-        self.kv_cache_specs['num_kv_heads'] = model_config.get_num_kv_heads(
-            parallel_config)
+        self.kv_cache_specs[
+            'num_kv_heads'] = self.model_config.get_num_kv_heads(
+                self.parallel_config)
 
-        if self.config.model_type in {'llama', 'granite'}:
+        if self.config.model_type in {'llama', 'granite', 'granitemoehybrid'}:
             self.kv_cache_specs['num_layers'] = self.config.num_hidden_layers
-            self.kv_cache_specs['head_dim'] = self.config.hidden_size // \
-                self.config.num_attention_heads
+            self.kv_cache_specs['head_dim'] = getattr(
+                self.model.config, "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads)
         elif self.config.model_type == 'gpt_bigcode':
             self.kv_cache_specs['num_layers'] = self.config.n_layer
             self.kv_cache_specs[
@@ -395,81 +389,9 @@ class ContinuousBatchingFmsModel(FmsModelBase):
 
         self.current_scale: Optional[list[tuple]] = None
 
-    def get_num_blocks_available(self) -> int:
-        """Function returns the number of available blocks/pages.
-        Will eventually contain a function in torch_sendnn which reads 
-        the actual value provided by the compiler for backend sendnn"""
-
-        max_batch_size = self.scheduler_config.max_num_seqs
-        max_model_len = self.scheduler_config.max_model_len
-        block_size = self.kv_cache_specs['block_size']
-
-        min_req_num_blocks = max_model_len // block_size
-
-        # TODO: replace the hard coded NUM_BLOCKS_SPYRE by calling a function
-        # in torch_sendnn which returns the value set by the Spyre compiler.
-        if ('granite-3.3-8b-instruct' in self.model_config.model
-                and self.parallel_config.world_size == 4):
-            # hard coded value for tensor parallel size 4 with the below model
-            # https://huggingface.co/ibm-granite/granite-3.3-8b-instruct
-
-            # num_blocks_spyre must be multiple of max_batch_size
-            NUM_BLOCKS_SPYRE = max_batch_size * (2080 // max_batch_size)
-            logger.info(
-                "Model %s and tensor parallel "
-                "size %d detected. Using NUM_BLOCKS_SPYRE = %d",
-                self.model_config.model,
-                self.parallel_config.world_size,
-                NUM_BLOCKS_SPYRE,
-            )
-        else:
-            # default value for any other model/ tensor parallel size
-            NUM_BLOCKS_SPYRE = max_batch_size * min_req_num_blocks
-            logger.info("No model / tensor parallel size specific value for " \
-            "the number of KV cache blocks available on Spyre found. Using " \
-            "default value (max_batch_size * max_model_len / block_size): %d",
-              NUM_BLOCKS_SPYRE)
-
-        if envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND == 'sendnn':
-            num_blocks_spyre = NUM_BLOCKS_SPYRE
-            assert num_blocks_spyre >= min_req_num_blocks, (
-                "Number of pages available on Spyre (%d) is not enough to "
-                "serve the current model (need at least %d pages)." %
-                (num_blocks_spyre, min_req_num_blocks))
-            max_concurrency_spyre = num_blocks_spyre * block_size \
-                / max_model_len
-            logger.info("Spyre KV cache size: %s tokens",
-                        num_blocks_spyre * block_size)
-            logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                        str(max_model_len), max_concurrency_spyre)
-
-            assert num_blocks_spyre % max_batch_size == 0, \
-                "num_blocks_spyre must be multiple of max_batch_size"
-            return num_blocks_spyre
-        else:  # dynamo backend 'eager'
-            # for debugging purposes we also put the spyre value here for cpu
-            num_blocks_cpu = NUM_BLOCKS_SPYRE
-            assert num_blocks_cpu >= min_req_num_blocks, (
-                "Number of pages available on CPU (%d) is not enough to "
-                "serve the current model (need at least %d pages)." %
-                (num_blocks_cpu, min_req_num_blocks))
-            max_concurrency_cpu = num_blocks_cpu * block_size \
-                / max_model_len
-            logger.info("CPU KV cache size: %s tokens",
-                        num_blocks_cpu * block_size)
-            logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                        str(max_model_len), max_concurrency_cpu)
-            return num_blocks_cpu
-
     def set_past_key_value_states(self, num_blocks) -> None:
-        # overwrite num_blocks for testing scheduler constraints
-        num_blocks_override = SpyrePlatform.get_num_spyre_blocks_override()
-        if num_blocks_override > 0:
-            num_blocks = num_blocks_override
-
         # List[layers] of Tuple[k,v] of
         # Tensor[num_blocks, block_size, num_kv_heads, head_dim]
-
         if not self.model_config.quantization:
             self.past_key_value_states = [
                 (torch.zeros(num_blocks,
@@ -685,15 +607,12 @@ class StaticBatchingFmsModel(FmsModelBase):
 
     def __init__(
         self,
-        model_config: ModelConfig,
-        parallel_config: ParallelConfig,
-        _: SchedulerConfig,
+        vllm_config: VllmConfig,
         max_prompt_length: int,
         max_decode_length: int,
         rank: int,
     ) -> None:
-        super().__init__(model_config,
-                         parallel_config,
+        super().__init__(vllm_config,
                          max_prompt_length,
                          max_decode_length,
                          rank,
